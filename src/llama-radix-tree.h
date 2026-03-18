@@ -220,7 +220,7 @@ private:
 
     void delete_recursive(llama_radix_node * node);
 
-    size_t matched_length(const llama_radix_node_key & a, const llama_radix_node_key & b);
+    static size_t matched_length(const llama_radix_node_key & a, const llama_radix_node_key & b);
 
     // helpers for cell_to_nodes_ tracking
     void register_cells(llama_radix_node * node);

@@ -172,6 +172,17 @@ public:
             std::vector<uint32_t>          & out_cell_indices,
             int64_t extra_key = 0);
 
+    // reclaim prefix cells: restore cell metadata (pos + seq_id) for cached prefix tokens
+    // so that they are treated as occupied by find_slot and do not get overwritten.
+    // returns the number of successfully reclaimed tokens.
+    // the reclaimed cells already contain valid KV data from a previous computation.
+    int32_t prefix_cache_reclaim(
+            llama_seq_id seq_id,
+            const llama_token * tokens,
+            uint32_t n_tokens,
+            const llama_pos * positions,
+            int64_t extra_key = 0);
+
     //
     // preparation API
     //

@@ -309,6 +309,60 @@ int32_t llama_kv_cache::prefix_cache_find(
     return valid_count;
 }
 
+int32_t llama_kv_cache::prefix_cache_reclaim(
+        llama_seq_id seq_id,
+        const llama_token * tokens,
+        uint32_t n_tokens,
+        const llama_pos * positions,
+        int64_t extra_key) {
+    if (!prefix_cache_enabled || !prefix_tree || n_tokens == 0) {
+        return 0;
+    }
+
+    // search the tree for matching prefix
+    std::vector<llama_token> token_vec(tokens, tokens + n_tokens);
+    std::vector<uint32_t> cached_cells;
+    int32_t matched = prefix_cache_find(token_vec, cached_cells, extra_key);
+
+    if (matched <= 0) {
+        return 0;
+    }
+
+    // reclaim each matched cell: restore its metadata (pos + seq_id)
+    // so that find_slot will see them as occupied and skip them
+    const uint32_t stream_id = seq_to_stream[seq_id];
+    auto & cells = v_cells[stream_id];
+
+    int32_t reclaimed = 0;
+    for (int32_t i = 0; i < matched; ++i) {
+        const uint32_t idx = cached_cells[i];
+
+        if (idx >= cells.size()) {
+            break;
+        }
+
+        // only reclaim if the cell is currently empty
+        // (if it's occupied by another seq, don't touch it)
+        if (!cells.is_empty(idx)) {
+            // cell is in use - check if it already has our seq at the right position
+            if (cells.seq_has(idx, seq_id) && cells.pos_get(idx) == positions[i]) {
+                // already correct, count as reclaimed
+                reclaimed++;
+                continue;
+            }
+            // occupied by something else - stop
+            break;
+        }
+
+        // restore cell metadata
+        cells.pos_set(idx, positions[i]);
+        cells.seq_add(idx, seq_id);
+        reclaimed++;
+    }
+
+    return reclaimed;
+}
+
 bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
     GGML_ASSERT(seq_id == -1 || (seq_id >= 0 && (size_t) seq_id < seq_to_stream.size()));
 
@@ -326,12 +380,20 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
 
         uint32_t new_head = cells.size();
 
+        const uint32_t strm = seq_to_stream[seq_id];
+
         for (uint32_t i = 0; i < cells.size(); ++i) {
             if (!cells.pos_in(i, p0, p1)) {
                 continue;
             }
 
             if (cells.seq_has(i, seq_id) && cells.seq_rm(i, seq_id)) {
+                // cell was freed - bump generation and invalidate tree entry
+                if (prefix_cache_enabled && prefix_tree && strm < cell_generations.size() && i < cell_generations[strm].size()) {
+                    cell_generations[strm][i]++;
+                    prefix_tree->invalidate_cell(i);
+                }
+
                 if (new_head == cells.size()) {
                     new_head = i;
                 }
@@ -356,6 +418,12 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
                 }
 
                 cells.rm(i);
+
+                // cell was freed - bump generation and invalidate tree entry
+                if (prefix_cache_enabled && prefix_tree && s < cell_generations.size() && i < cell_generations[s].size()) {
+                    cell_generations[s][i]++;
+                    prefix_tree->invalidate_cell(i);
+                }
 
                 if (new_head == cells.size()) {
                     new_head = i;
@@ -467,8 +535,16 @@ void llama_kv_cache::seq_keep(llama_seq_id seq_id) {
 
     uint32_t new_head = cells.size();
 
+    const uint32_t strm = seq_to_stream[seq_id];
+
     for (uint32_t i = 0; i < cells.size(); ++i) {
         if (cells.seq_keep(i, seq_id)) {
+            // cell was freed - bump generation and invalidate tree entry
+            if (prefix_cache_enabled && prefix_tree && strm < cell_generations.size() && i < cell_generations[strm].size()) {
+                cell_generations[strm][i]++;
+                prefix_tree->invalidate_cell(i);
+            }
+
             if (new_head == cells.size()) {
                 new_head = i;
             }
@@ -642,6 +718,10 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_
         std::vector<uint32_t> v_heads_old; // old positions of the heads, before placing the ubatch
 
         std::vector<llama_kv_cells> v_cells; // copy of the old cells, before placing the ubatch
+
+        // prefix cache: cells that were reclaimed during this dry run and need to be un-reclaimed
+        std::vector<uint32_t> reclaimed_cells;
+        uint32_t reclaimed_stream = 0;
     };
 
     // remember the old state of the cells so we can restore it in the end
@@ -650,31 +730,75 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_
     bool success = true;
 
     for (const auto & ubatch : ubatches) {
-        // only find a suitable slot for the ubatch. don't modify the cells yet
+        // prefix cache: try to reclaim cached prefix cells before finding new slots.
+        // this only works for single-stream unified cache currently.
+        int32_t n_prefix = 0;
+        std::vector<uint32_t> prefix_cells;
+
+        if (prefix_cache_enabled && prefix_tree && n_stream == 1 && ubatch.n_seqs_unq == 1) {
+            const llama_seq_id seq_id = ubatch.seq_id_unq[0];
+
+            // search the tree for matching prefix
+            std::vector<llama_token> token_vec(ubatch.token, ubatch.token + ubatch.n_tokens);
+            std::vector<uint32_t> cached_cells;
+            int32_t matched = prefix_cache_find(token_vec, cached_cells);
+
+            if (matched > 0) {
+                // try to reclaim the matched cells
+                n_prefix = prefix_cache_reclaim(seq_id, ubatch.token, matched, ubatch.pos);
+                if (n_prefix > 0) {
+                    prefix_cells.assign(cached_cells.begin(), cached_cells.begin() + n_prefix);
+                }
+            }
+        }
+
+        // find a suitable slot for the ubatch (find_slot finds cells for ALL tokens,
+        // but reclaimed prefix cells are now occupied and won't be handed out again)
         const auto sinfo_new = find_slot(ubatch, false);
         if (sinfo_new.empty()) {
+            // undo any reclaimed cells before failing
+            if (n_prefix > 0) {
+                const uint32_t strm = sinfo_new.empty() ? 0 : sinfo_new.strm[0];
+                auto & cells = v_cells[strm];
+                for (auto idx : prefix_cells) {
+                    if (!cells.is_empty(idx)) {
+                        cells.rm(idx);
+                    }
+                }
+            }
             success = false;
             break;
         }
 
-        // remeber the position that we found
-        res.push_back(sinfo_new);
+        // for prefix-cached tokens, replace find_slot's cell indices with the cached ones.
+        // this ensures the KV data in those cells is reused rather than overwritten with new cells.
+        // note: this modifies sinfo_new, so we make a mutable copy.
+        slot_info sinfo_final = sinfo_new;
+        if (n_prefix > 0 && sinfo_final.n_stream() == 1) {
+            for (int32_t i = 0; i < n_prefix && i < (int32_t)sinfo_final.idxs[0].size(); ++i) {
+                sinfo_final.idxs[0][i] = prefix_cells[i];
+            }
+        }
+
+        // remember the position that we found
+        res.push_back(sinfo_final);
 
         // store the old state of the cells in the recovery stack
         {
-            state_t state = { sinfo_new, v_heads, {} };
+            state_t state = { sinfo_final, v_heads, {}, prefix_cells, 0 };
 
-            for (uint32_t s = 0; s < sinfo_new.n_stream(); ++s) {
-                auto & cells = v_cells[sinfo_new.strm[s]];
+            for (uint32_t s = 0; s < sinfo_final.n_stream(); ++s) {
+                auto & cells = v_cells[sinfo_final.strm[s]];
 
-                state.v_cells.push_back(cells.cp(sinfo_new.idxs[s]));
+                state.v_cells.push_back(cells.cp(sinfo_final.idxs[s]));
+                state.reclaimed_stream = sinfo_final.strm[s];
             }
 
             states.push_back(std::move(state));
         }
 
         // now emplace the ubatch
-        apply_ubatch(sinfo_new, ubatch);
+        apply_ubatch(sinfo_final, ubatch);
     }
 
     GGML_ASSERT(!states.empty() || !success);
@@ -689,6 +813,28 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_
 
             cells.set(sinfo.idxs[s], it->v_cells[s]);
             head = it->v_heads_old[s];
+        }
+
+        // also restore any prefix-reclaimed cells that were temporarily claimed
+        if (!it->reclaimed_cells.empty()) {
+            auto & cells = v_cells[it->reclaimed_stream];
+            for (auto idx : it->reclaimed_cells) {
+                // the cells.set() above should have already restored these,
+                // but in case they weren't part of sinfo.idxs, clean them up
+                if (!cells.is_empty(idx)) {
+                    // check if this cell was in sinfo.idxs - if so, already restored
+                    bool in_sinfo = false;
+                    for (uint32_t s2 = 0; s2 < sinfo.n_stream(); ++s2) {
+                        for (auto si : sinfo.idxs[s2]) {
+                            if (si == idx) { in_sinfo = true; break; }
+                        }
+                        if (in_sinfo) break;
+                    }
+                    if (!in_sinfo) {
+                        cells.rm(idx);
+                    }
+                }
+            }
         }
     }
 
@@ -2096,6 +2242,18 @@ bool llama_kv_cache_context::apply() {
 
     kv->apply_ubatch(sinfos[i_cur], ubatches[i_cur]);
     n_kv = kv->get_n_kv(sinfos[i_cur]);
+
+    // auto-promote: register the completed ubatch tokens into the prefix tree
+    {
+        const auto & ubatch = ubatches[i_cur];
+        const auto & sinfo  = sinfos[i_cur];
+
+        if (ubatch.token && sinfo.n_stream() == 1 && !sinfo.idxs[0].empty()) {
+            std::vector<llama_token> tokens(ubatch.token, ubatch.token + ubatch.n_tokens);
+            std::vector<uint32_t>    cells(sinfo.idxs[0].begin(), sinfo.idxs[0].end());
+            kv->prefix_cache_promote(tokens, cells);
+        }
+    }
 
     return true;
 }
