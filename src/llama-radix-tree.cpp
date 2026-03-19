@@ -112,8 +112,44 @@ bool llama_radix_tree::insert(const llama_radix_node_key & key, const llama_radi
         cur = deepest;
     }
 
-    // Full match - just bump ref count
+    // If we matched all tokens in the key but only partially matched the last
+    // edge, we need to split that edge first so the upper node exactly covers
+    // the matched portion.
+    if (matched == (size_t)key.token_ids.size()
+            && edge_matched > 0
+            && edge_matched < (size_t)deepest->key.token_ids.size()) {
+        auto [upper, lower] = split(deepest, edge_matched);
+        (void)lower;
+        deepest = upper;
+    }
+
+    // Full match - update value and bump ref count
     if (matched == (size_t)key.token_ids.size()) {
+        // Update value: the caller may be re-promoting with new cell indices
+        // after the old ones were invalidated. We need to rebuild the value
+        // across all nodes on the matched path.
+        llama_radix_node * walk = root_.get();
+        size_t walk_matched = 0;
+        while (walk_matched < matched) {
+            bool found_child = false;
+            auto rest = key.token_ids.subview(walk_matched, key.token_ids.size() - walk_matched);
+            llama_radix_node_key rest_key{rest, key.extra_key};
+            for (auto & [child_key, child_ptr] : walk->children) {
+                size_t ml = matched_length(rest_key, child_key);
+                if (ml == 0) { continue; }
+                // Update this child's value with the new cells/generations
+                unregister_cells(child_ptr);
+                size_t update_len = (size_t)child_ptr->key.token_ids.size();
+                child_ptr->value.cell_indices    = value.cell_indices.subview(walk_matched, update_len);
+                child_ptr->value.cell_generations = value.cell_generations.subview(walk_matched, update_len);
+                register_cells(child_ptr);
+                walk_matched += update_len;
+                walk = child_ptr;
+                found_child = true;
+                break;
+            }
+            if (!found_child) { break; }
+        }
         deepest->ref_count++;
         return true;
     }
