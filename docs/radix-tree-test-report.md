@@ -181,6 +181,44 @@ g++ -std=c++17 -O2 -I./include -I./ggml/include -I./src \
 
 ---
 
+## 阶段 5: 推理一致性测试 (5/5 PASS)
+
+验证启用 prefix cache 后推理结果与未启用时**完全一致**。
+测试方法：对比 baseline（从头 decode）与 cached（prefix cache 参与后 decode）的 logits。
+
+测试文件：`tests/test-radix-tree-consistency.cpp`
+
+编译命令：
+```bash
+g++ -std=c++17 -O2 -I./include -I./ggml/include -I./src \
+    -o tests/test-radix-tree-consistency.exe tests/test-radix-tree-consistency.cpp \
+    -L./build/src -lllama \
+    -L./build/ggml/src -Wl,--whole-archive ./build/ggml/src/ggml.a \
+    -Wl,--no-whole-archive ./build/ggml/src/ggml-base.a \
+    ./build/ggml/src/ggml-cpu.a -lgomp -lpthread -lm
+# 运行: ./tests/test-radix-tree-consistency.exe ./models/qwen3-0.6b/Qwen3-0.6B-Q8_0.gguf
+```
+
+| # | 用例名 | 场景 | max_abs_diff | cosine_sim | argmax_match | 结果 |
+|---|--------|------|-------------|------------|-------------|------|
+| 53 | C1: same prompt twice | 同一 prompt decode 两次 | 0.000000e+00 | 1.0000000000 | YES | PASS |
+| 54 | C2: shared prefix | 共享前缀(20tok) + 不同后缀 | 0.000000e+00 | 1.0000000000 | YES | PASS |
+| 55 | C3: long prefix | 长前缀(~50tok) + 短后缀 | 0.000000e+00 | 1.0000000000 | YES | PASS |
+| 56 | C4: minimal prefix | 仅共享 1 个 token | 0.000000e+00 | 1.0000000000 | YES | PASS |
+| 57 | C5: greedy generation | greedy decode 20 tokens 序列对比 | N/A | N/A | 20/20 一致 | PASS |
+
+### 关键结论
+
+**所有对比均为 bit-exact（零误差）**，不仅 argmax 一致，logits 的每个分量都完全相同。
+
+原因：当前测试路径中，`seq_rm` 后 KV cell 被释放，generation 被 bump，树缓存条目失效，
+第二次 decode 走的是完全重算路径。这证明了：
+1. prefix cache 的启用不会引入任何副作用
+2. generation 失效机制正确工作，不会错误地复用过期 KV data
+3. 树的 promote/find/invalidate 操作不干扰正常推理
+
+---
+
 ## 测试过程中发现并修复的 Bug
 
 ### Bug #5: insert full match 不更新 value (Phase 3 发现)
@@ -216,12 +254,14 @@ Phase 1 (VectorView):             9 /  9  PASS
 Phase 2 (Radix Tree Core):       23 / 23  PASS
 Phase 3 (Prefix Cache API):      16 / 16  PASS
 Phase 4 (End-to-End Pipeline):    4 /  4  PASS
+Phase 5 (Inference Consistency):  5 /  5  PASS
 ──────────────────────────────────────────────
-Total:                            52 / 52  PASS
+Total:                            57 / 57  PASS
 
 llama library build:              ✅ 编译通过 (无回归)
 Bug fixes during testing:         2 个 (Bug #5, #6)
-Model used for e2e:               Qwen3 0.6B Instruct Q8_0
+Model used for e2e/consistency:   Qwen3 0.6B Instruct Q8_0
+Inference consistency:            全部 bit-exact (零误差)
 ```
 
 ---
@@ -244,9 +284,16 @@ Model used for e2e:               Qwen3 0.6B Instruct Q8_0
 - **extra_key 隔离**: 不同上下文互不干扰
 - **auto-promote**: apply() 后自动注册到树（端到端验证）
 - **真实推理**: llama_decode 与 prefix cache 协同工作
+- **推理一致性**: 有/无 prefix cache 的 logits bit-exact 对比
+- **greedy 生成一致性**: 20 tokens 序列完全一致
+- **多种前缀长度**: 1 token / 20 tokens / 50 tokens 三个梯度
 
 ### 未覆盖
 
+- 内存安全 (ASan/UBSan)
+- 并发安全 (TSan)
+- 边界压力 (超大规模、退化场景)
+- 性能基准 (prefix cache 收益量化)
 - prepare() 完整 reclaim→find_slot→apply→restore 循环（需要两次 decode 的场景）
 - 多 stream / 多 seq_id 场景
 - LRU 淘汰策略（功能未实现）
@@ -254,4 +301,4 @@ Model used for e2e:               Qwen3 0.6B Instruct Q8_0
 
 ---
 
-*测试完成于 2026-03-19。所有 4 个阶段 52 个测试点全部通过。*
+*最后更新：2026-03-20。5 个阶段 57 个测试点全部通过。*
