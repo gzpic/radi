@@ -207,6 +207,13 @@ public:
     // GraphViz visualization
     std::string dot() const;
 
+    // LRU eviction: remove least-recently-accessed leaf nodes until
+    // node count drops below max_nodes. Returns number of nodes evicted.
+    int32_t evict_lru(int32_t max_nodes);
+
+    // get current node count
+    int32_t node_count() const { return node_count_; }
+
 private:
     int32_t node_count_ = 0;
     llama_radix_tree_options options_;
@@ -227,4 +234,10 @@ private:
     void unregister_cells(llama_radix_node * node);
 
     static void dot_helper(const llama_radix_node * n, int32_t pid, int32_t & id_gen, std::ostringstream & os);
+
+    // collect all leaf nodes for LRU eviction
+    void collect_leaves(llama_radix_node * node, std::vector<llama_radix_node *> & leaves);
+
+    // remove a leaf node and clean up parent if it becomes empty
+    void remove_leaf(llama_radix_node * leaf);
 };

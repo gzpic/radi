@@ -216,16 +216,21 @@ void llama_kv_cache::clear(bool data) {
         for (auto & [_, buf] : ctxs_bufs) {
             ggml_backend_buffer_clear(buf.get(), 0);
         }
-    }
 
-    // clear the prefix tree as well
-    if (prefix_cache_enabled && prefix_tree) {
-        prefix_tree->clear();
-    }
+        // data buffers are zeroed — prefix tree entries are now invalid
+        if (prefix_cache_enabled && prefix_tree) {
+            prefix_tree->clear();
+        }
 
-    // reset generation counters
-    for (uint32_t s = 0; s < n_stream; ++s) {
-        std::fill(cell_generations[s].begin(), cell_generations[s].end(), 1);
+        // reset generation counters (data is gone)
+        for (uint32_t s = 0; s < n_stream; ++s) {
+            std::fill(cell_generations[s].begin(), cell_generations[s].end(), 1);
+        }
+    } else {
+        // data == false: cell metadata is cleared but KV data in buffers survives.
+        // keep the prefix tree and generation counters intact so that future
+        // find() + reclaim() can restore cell metadata and reuse the existing
+        // KV data without recomputation (A3: multi-turn append mode).
     }
 }
 
@@ -361,6 +366,133 @@ int32_t llama_kv_cache::prefix_cache_reclaim(
     }
 
     return reclaimed;
+}
+
+//
+// checkpoint / rollback (A2)
+//
+
+int32_t llama_kv_cache::checkpoint_save() {
+    kv_checkpoint cp;
+    cp.id       = next_checkpoint_id++;
+    cp.pos_end  = seq_pos_max(0);  // track seq 0 position
+    cp.n_tokens = (cp.pos_end >= 0) ? (uint32_t)(cp.pos_end + 1) : 0;
+
+    checkpoints.push_back(cp);
+    return cp.id;
+}
+
+bool llama_kv_cache::checkpoint_rollback(int32_t checkpoint_id) {
+    // find the checkpoint
+    auto it = std::find_if(checkpoints.begin(), checkpoints.end(),
+        [checkpoint_id](const kv_checkpoint & cp) { return cp.id == checkpoint_id; });
+
+    if (it == checkpoints.end()) {
+        return false;
+    }
+
+    const llama_pos rollback_pos = it->pos_end;
+
+    // remove all KV entries after the checkpoint position
+    if (rollback_pos >= 0) {
+        seq_rm(0, rollback_pos + 1, -1);
+    } else {
+        // checkpoint was at empty state — clear everything
+        seq_rm(0, 0, -1);
+    }
+
+    // remove this checkpoint and all later ones
+    checkpoints.erase(it, checkpoints.end());
+
+    return true;
+}
+
+//
+// fork / merge (A18)
+//
+
+llama_seq_id llama_kv_cache::fork(llama_seq_id parent_seq) {
+    const llama_seq_id new_seq = next_fork_seq_id++;
+
+    if ((size_t)new_seq >= n_seq_max) {
+        next_fork_seq_id--;
+        return -1;  // exceeded max sequences
+    }
+
+    // copy all KV from parent to new sequence
+    seq_cp(parent_seq, new_seq, 0, -1);
+
+    forked_branches.push_back(new_seq);
+    return new_seq;
+}
+
+bool llama_kv_cache::merge(llama_seq_id winner) {
+    if (winner < 0) {
+        return false;
+    }
+
+    // remove all non-winner branches
+    for (auto it = forked_branches.begin(); it != forked_branches.end(); ) {
+        if (*it != winner) {
+            seq_rm(*it, 0, -1);
+            it = forked_branches.erase(it);
+        } else {
+            ++it;
+        }
+    }
+
+    // if winner is not seq 0, copy winner to seq 0 and remove winner
+    if (winner != 0) {
+        seq_rm(0, 0, -1);          // clear seq 0
+        seq_cp(winner, 0, 0, -1);  // copy winner → seq 0
+        seq_rm(winner, 0, -1);     // remove the winner branch
+
+        // remove winner from forked_branches
+        forked_branches.erase(
+            std::remove(forked_branches.begin(), forked_branches.end(), winner),
+            forked_branches.end());
+    }
+
+    return true;
+}
+
+std::vector<llama_seq_id> llama_kv_cache::get_fork_branches() const {
+    return forked_branches;
+}
+
+//
+// selective trim (A4)
+//
+
+int32_t llama_kv_cache::selective_trim(llama_pos p0, llama_pos p1,
+                                       const llama_token * remaining_tokens,
+                                       const uint32_t    * remaining_cells,
+                                       int32_t             n_remaining) {
+    if (p0 < 0 || p1 <= p0) {
+        return -1;
+    }
+
+    const llama_pos n_remove = p1 - p0;
+
+    // step 1: remove the target range from seq 0
+    // (seq_rm already invalidates freed cells in the prefix tree)
+    if (!seq_rm(0, p0, p1)) {
+        return -1;
+    }
+
+    // step 2: shift positions >= p1 down by n_remove to close the gap
+    // (seq_add now invalidates shifted cells in the prefix tree)
+    seq_add(0, p1, -1, -n_remove);
+
+    // step 3: re-promote the surviving token sequence into the prefix tree
+    // so future searches against the post-trim sequence can find matches
+    if (remaining_tokens && remaining_cells && n_remaining > 0) {
+        std::vector<llama_token> tokens(remaining_tokens, remaining_tokens + n_remaining);
+        std::vector<uint32_t>    cells(remaining_cells,  remaining_cells  + n_remaining);
+        prefix_cache_promote(tokens, cells);
+    }
+
+    return (int32_t)n_remove;
 }
 
 bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
@@ -589,6 +721,16 @@ void llama_kv_cache::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, ll
         }
 
         if (cells.seq_has(i, seq_id)) {
+            // Position is changing — invalidate the tree entry for this cell
+            // so stale token→cell mappings don't persist.
+            if (prefix_cache_enabled && prefix_tree) {
+                const uint32_t strm = seq_to_stream[seq_id];
+                if (strm < cell_generations.size() && i < cell_generations[strm].size()) {
+                    cell_generations[strm][i]++;
+                    prefix_tree->invalidate_cell(i);
+                }
+            }
+
             if (cells.pos_add(i, shift)) {
                 if (new_head == cells.size()) {
                     new_head = i;
@@ -631,6 +773,15 @@ void llama_kv_cache::seq_div(llama_seq_id seq_id, llama_pos p0, llama_pos p1, in
         }
 
         if (cells.seq_has(i, seq_id)) {
+            // Position is changing — invalidate the tree entry for this cell
+            if (prefix_cache_enabled && prefix_tree) {
+                const uint32_t strm = seq_to_stream[seq_id];
+                if (strm < cell_generations.size() && i < cell_generations[strm].size()) {
+                    cell_generations[strm][i]++;
+                    prefix_tree->invalidate_cell(i);
+                }
+            }
+
             cells.pos_div(i, d);
         }
     }
@@ -690,8 +841,39 @@ llama_memory_context_ptr llama_kv_cache::init_batch(
             break;
         }
 
+        // A1: consume prefix match info from prepare() and trim ubatches/sinfos
+        auto prefix_matches = std::move(pending_prefix_matches);
+
+        for (size_t i = 0; i < ubatches.size() && i < prefix_matches.size(); ++i) {
+            const auto & pm = prefix_matches[i];
+            if (pm.n_prefix > 0 && pm.n_prefix < (int32_t)ubatches[i].n_tokens) {
+                const uint32_t skip = (uint32_t)pm.n_prefix;
+
+                // trim ubatch: create a suffix view skipping the first n_prefix tokens
+                auto & ub = ubatches[i];
+                ub.token     += skip;
+                ub.pos       += skip * ub.n_pos;
+                ub.n_seq_id  += skip;
+                ub.seq_id    += skip;
+                ub.output    += skip;
+                if (ub.embd) {
+                    // n_embd not available here, but embd is typically null for token batches
+                    ub.embd = nullptr;
+                }
+                ub.n_tokens     -= skip;
+                ub.n_seq_tokens -= skip;
+
+                // trim sinfo: remove the first n_prefix cell indices
+                if (sinfos[i].n_stream() == 1 && sinfos[i].idxs[0].size() > skip) {
+                    sinfos[i].idxs[0].erase(
+                        sinfos[i].idxs[0].begin(),
+                        sinfos[i].idxs[0].begin() + skip);
+                }
+            }
+        }
+
         return std::make_unique<llama_kv_cache_context>(
-                this, std::move(sinfos), std::move(ubatches));
+                this, std::move(sinfos), std::move(ubatches), std::move(prefix_matches));
     } while (false);
 
     return std::make_unique<llama_kv_cache_context>(LLAMA_MEMORY_STATUS_FAILED_PREPARE);
@@ -712,6 +894,10 @@ llama_memory_context_ptr llama_kv_cache::init_update(llama_context * lctx, bool 
 llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_ubatch> & ubatches) {
     llama_kv_cache::slot_info_vec_t res;
 
+    // A1: clear any stale prefix match info from a previous prepare() call
+    pending_prefix_matches.clear();
+    pending_prefix_matches.resize(ubatches.size());
+
     struct state_t {
         slot_info sinfo; // slot info for the ubatch
 
@@ -729,7 +915,9 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_
 
     bool success = true;
 
-    for (const auto & ubatch : ubatches) {
+    for (size_t ub_idx = 0; ub_idx < ubatches.size(); ++ub_idx) {
+        const auto & ubatch = ubatches[ub_idx];
+
         // prefix cache: try to reclaim cached prefix cells before finding new slots.
         // this only works for single-stream unified cache currently.
         int32_t n_prefix = 0;
@@ -748,6 +936,14 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_
                 n_prefix = prefix_cache_reclaim(seq_id, ubatch.token, matched, ubatch.pos);
                 if (n_prefix > 0) {
                     prefix_cells.assign(cached_cells.begin(), cached_cells.begin() + n_prefix);
+
+                    // A1: store prefix info for init_batch() to create trimmed ubatches
+                    auto & pm = pending_prefix_matches[ub_idx];
+                    pm.n_prefix = n_prefix;
+                    pm.prefix_cells = prefix_cells;
+                    pm.full_tokens.assign(ubatch.token, ubatch.token + ubatch.n_tokens);
+                    pm.prefix_positions.assign(ubatch.pos, ubatch.pos + n_prefix);
+                    pm.seq_id = seq_id;
                 }
             }
         }
@@ -758,7 +954,7 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_
         if (sinfo_new.empty()) {
             // undo any reclaimed cells before failing
             if (n_prefix > 0) {
-                const uint32_t strm = sinfo_new.empty() ? 0 : sinfo_new.strm[0];
+                const uint32_t strm = 0;
                 auto & cells = v_cells[strm];
                 for (auto idx : prefix_cells) {
                     if (!cells.is_empty(idx)) {
@@ -2218,6 +2414,16 @@ llama_kv_cache_context::llama_kv_cache_context(
         std::vector<llama_ubatch> ubatches) : status(LLAMA_MEMORY_STATUS_SUCCESS), kv(kv), sinfos(std::move(sinfos)), ubatches(std::move(ubatches)) {
 }
 
+llama_kv_cache_context::llama_kv_cache_context(
+        llama_kv_cache * kv,
+        llama_kv_cache::slot_info_vec_t sinfos,
+        std::vector<llama_ubatch> ubatches,
+        std::vector<llama_prefix_match_info> prefix_matches)
+    : status(LLAMA_MEMORY_STATUS_SUCCESS), kv(kv),
+      sinfos(std::move(sinfos)), ubatches(std::move(ubatches)),
+      prefix_matches(std::move(prefix_matches)) {
+}
+
 llama_kv_cache_context::~llama_kv_cache_context() = default;
 
 bool llama_kv_cache_context::next() {
@@ -2240,11 +2446,34 @@ bool llama_kv_cache_context::apply() {
         return true;
     }
 
+    // A1: reclaim prefix cells before apply_ubatch.
+    // the prefix tokens were trimmed from the ubatch in init_batch(),
+    // but their KV data is still valid in the cache. we restore their
+    // cell metadata so the attention mask covers them.
+    const bool has_prefix = (i_cur < prefix_matches.size() && prefix_matches[i_cur].n_prefix > 0);
+
+    if (has_prefix) {
+        const auto & pm = prefix_matches[i_cur];
+        kv->prefix_cache_reclaim(pm.seq_id, pm.full_tokens.data(), pm.n_prefix, pm.prefix_positions.data());
+    }
+
+    // apply the (possibly trimmed) ubatch — only new tokens get cell metadata set
     kv->apply_ubatch(sinfos[i_cur], ubatches[i_cur]);
     n_kv = kv->get_n_kv(sinfos[i_cur]);
 
-    // auto-promote: register the completed ubatch tokens into the prefix tree
-    {
+    // auto-promote: register the FULL token sequence (prefix + new) into the prefix tree
+    if (has_prefix) {
+        const auto & pm    = prefix_matches[i_cur];
+        const auto & sinfo = sinfos[i_cur];
+
+        if (sinfo.n_stream() == 1) {
+            // combine: prefix_cells + new_cells
+            std::vector<uint32_t> all_cells = pm.prefix_cells;
+            all_cells.insert(all_cells.end(), sinfo.idxs[0].begin(), sinfo.idxs[0].end());
+            kv->prefix_cache_promote(pm.full_tokens, all_cells);
+        }
+    } else {
+        // no prefix skip — promote normally
         const auto & ubatch = ubatches[i_cur];
         const auto & sinfo  = sinfos[i_cur];
 

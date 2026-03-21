@@ -14,6 +14,15 @@ struct llama_hparams;
 struct llama_model;
 struct llama_context;
 
+// info about prefix tokens that were matched and can be skipped (A1)
+struct llama_prefix_match_info {
+    int32_t                  n_prefix = 0;        // number of prefix tokens matched
+    std::vector<uint32_t>    prefix_cells;         // cell indices for prefix tokens
+    std::vector<llama_token> full_tokens;           // full token sequence (prefix + new) for auto-promote
+    std::vector<llama_pos>   prefix_positions;      // positions for prefix tokens
+    llama_seq_id             seq_id = 0;            // sequence id
+};
+
 //
 // llama_kv_cache
 //
@@ -184,6 +193,46 @@ public:
             int64_t extra_key = 0);
 
     //
+    // checkpoint / rollback API (for Agent scenarios)
+    //
+
+    // save a checkpoint at the current KV state (O(1), records pos boundary)
+    int32_t checkpoint_save();
+
+    // rollback to a saved checkpoint (uses seq_rm to delete tokens after boundary)
+    bool checkpoint_rollback(int32_t checkpoint_id);
+
+    //
+    // fork / merge API (A18: multi-candidate action tree search)
+    //
+
+    // fork: copy seq 0's KV to a new sequence, returns the new seq_id.
+    // the new branch shares KV data up to the fork point.
+    // returns -1 on failure (e.g., max sequences exceeded).
+    llama_seq_id fork(llama_seq_id parent_seq = 0);
+
+    // merge: keep the winner branch, remove all other forked branches.
+    // winner's KV is copied back to seq 0 if winner != 0.
+    // returns true on success.
+    bool merge(llama_seq_id winner);
+
+    // get all active forked sequence ids (excluding seq 0)
+    std::vector<llama_seq_id> get_fork_branches() const;
+
+    //
+    // selective trim API (A4: long conversation survival)
+    //
+
+    // trim: remove KV entries in position range [p0, p1) for seq 0,
+    // then shift all positions >= p1 down by (p1 - p0) to close the gap.
+    // use case: delete middle turns while keeping system prompt + recent context.
+    // returns the number of positions removed, or -1 on failure.
+    int32_t selective_trim(llama_pos p0, llama_pos p1,
+                          const llama_token * remaining_tokens = nullptr,
+                          const uint32_t    * remaining_cells  = nullptr,
+                          int32_t             n_remaining      = 0);
+
+    //
     // preparation API
     //
 
@@ -280,6 +329,29 @@ private:
     // used to detect stale entries in the radix tree
     std::vector<std::vector<uint64_t>> cell_generations; // [stream][cell_idx]
 
+    //
+    // checkpoint / rollback (A2)
+    //
+
+    struct kv_checkpoint {
+        int32_t   id;
+        llama_pos pos_end;     // seq_pos_max at save time
+        uint32_t  n_tokens;    // number of tokens in KV cache at save time
+    };
+
+    std::vector<kv_checkpoint> checkpoints;
+    int32_t next_checkpoint_id = 0;
+
+    //
+    // fork / merge tracking (A18)
+    //
+
+    std::vector<llama_seq_id> forked_branches;  // active forked seq ids
+    llama_seq_id next_fork_seq_id = 1;          // next seq id to assign
+
+    // temporary: populated by prepare(), consumed by init_batch() (A1)
+    std::vector<llama_prefix_match_info> pending_prefix_matches;
+
     size_t total_size() const;
 
     size_t size_k_bytes() const;
@@ -333,11 +405,18 @@ public:
             bool do_shift,
             stream_copy_info sc_info);
 
-    // used to create a batch procesing context from a batch
+    // used to create a batch processing context from a batch
     llama_kv_cache_context(
             llama_kv_cache * kv,
             slot_info_vec_t sinfos,
             std::vector<llama_ubatch> ubatches);
+
+    // used to create a batch processing context with prefix skip info (A1)
+    llama_kv_cache_context(
+            llama_kv_cache * kv,
+            slot_info_vec_t sinfos,
+            std::vector<llama_ubatch> ubatches,
+            std::vector<llama_prefix_match_info> prefix_matches);
 
     virtual ~llama_kv_cache_context();
 
@@ -415,4 +494,7 @@ private:
     // a heuristic, to avoid attending the full cache if it is not yet utilized
     // as the cache gets filled, the benefit from this heuristic disappears
     int32_t n_kv;
+
+    // prefix skip info per ubatch (A1: skip prefill)
+    std::vector<llama_prefix_match_info> prefix_matches;
 };

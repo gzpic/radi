@@ -3,6 +3,7 @@
 #include "llama-impl.h"
 #include "llama-batch.h"
 #include "llama-io.h"
+#include "llama-kv-cache.h"
 #include "llama-memory.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
@@ -2637,6 +2638,86 @@ bool llama_memory_can_shift(llama_memory_t mem) {
     }
 
     return mem->get_can_shift();
+}
+
+void llama_memory_prefix_cache_enable(llama_memory_t mem) {
+    if (!mem) {
+        return;
+    }
+
+    // prefix cache is only supported by llama_kv_cache
+    auto * kv = dynamic_cast<llama_kv_cache *>(mem);
+    if (kv) {
+        kv->prefix_cache_enable();
+    }
+}
+
+int32_t llama_memory_checkpoint_save(llama_memory_t mem) {
+    if (!mem) {
+        return -1;
+    }
+
+    auto * kv = dynamic_cast<llama_kv_cache *>(mem);
+    if (kv) {
+        return kv->checkpoint_save();
+    }
+
+    return -1;
+}
+
+bool llama_memory_checkpoint_rollback(llama_memory_t mem, int32_t checkpoint_id) {
+    if (!mem) {
+        return false;
+    }
+
+    auto * kv = dynamic_cast<llama_kv_cache *>(mem);
+    if (kv) {
+        return kv->checkpoint_rollback(checkpoint_id);
+    }
+
+    return false;
+}
+
+llama_seq_id llama_memory_fork(llama_memory_t mem, llama_seq_id parent_seq) {
+    if (!mem) {
+        return -1;
+    }
+
+    auto * kv = dynamic_cast<llama_kv_cache *>(mem);
+    if (kv) {
+        return kv->fork(parent_seq);
+    }
+
+    return -1;
+}
+
+bool llama_memory_merge(llama_memory_t mem, llama_seq_id winner) {
+    if (!mem) {
+        return false;
+    }
+
+    auto * kv = dynamic_cast<llama_kv_cache *>(mem);
+    if (kv) {
+        return kv->merge(winner);
+    }
+
+    return false;
+}
+
+int32_t llama_memory_selective_trim(llama_memory_t mem, llama_pos p0, llama_pos p1,
+                                    const llama_token * remaining_tokens,
+                                    const uint32_t    * remaining_cells,
+                                    int32_t             n_remaining) {
+    if (!mem) {
+        return -1;
+    }
+
+    auto * kv = dynamic_cast<llama_kv_cache *>(mem);
+    if (kv) {
+        return kv->selective_trim(p0, p1, remaining_tokens, remaining_cells, n_remaining);
+    }
+
+    return -1;
 }
 
 // llama state API

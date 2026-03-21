@@ -704,6 +704,61 @@ extern "C" {
     LLAMA_API bool llama_memory_can_shift(llama_memory_t mem);
 
     //
+    // Prefix cache (radix tree based KV reuse)
+    //
+
+    // Enable prefix caching on the memory object (KV cache only).
+    // Once enabled, completed token sequences are automatically indexed,
+    // and future decodes will skip prefill for prefix-matched tokens.
+    // No-op if the memory type does not support prefix caching.
+    LLAMA_API void llama_memory_prefix_cache_enable(llama_memory_t mem);
+
+    //
+    // Checkpoint / rollback (for Agent scenarios)
+    //
+
+    // Save a checkpoint at the current KV cache state.
+    // Returns a checkpoint id (>= 0) that can be used with rollback, or -1 on failure.
+    LLAMA_API int32_t llama_memory_checkpoint_save(llama_memory_t mem);
+
+    // Rollback to a previously saved checkpoint.
+    // All KV entries after the checkpoint are removed (seq_rm).
+    // Returns true on success, false if checkpoint id is invalid.
+    LLAMA_API bool llama_memory_checkpoint_rollback(
+            llama_memory_t mem,
+                   int32_t checkpoint_id);
+
+    //
+    // Fork / Merge (for Agent multi-candidate action tree search)
+    //
+
+    // Fork: copy a sequence's KV to a new branch. Returns new seq_id, or -1 on failure.
+    LLAMA_API llama_seq_id llama_memory_fork(
+            llama_memory_t mem,
+              llama_seq_id parent_seq);
+
+    // Merge: keep the winner branch, remove all others. Winner is copied to seq 0.
+    LLAMA_API bool llama_memory_merge(
+            llama_memory_t mem,
+              llama_seq_id winner);
+
+    //
+    // Selective Trim (for long conversation management)
+    //
+
+    // Remove KV entries in position range [p0, p1) and shift subsequent positions down.
+    // If remaining_tokens/remaining_cells are provided (non-null, n_remaining > 0),
+    // the surviving token-to-cell mapping is re-promoted into the prefix tree.
+    // Returns number of positions removed, or -1 on failure.
+    LLAMA_API int32_t llama_memory_selective_trim(
+            llama_memory_t     mem,
+                 llama_pos     p0,
+                 llama_pos     p1,
+           const llama_token * remaining_tokens,
+           const uint32_t    * remaining_cells,
+                 int32_t       n_remaining);
+
+    //
     // State / sessions
     //
 

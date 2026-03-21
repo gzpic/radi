@@ -227,6 +227,15 @@ llama_radix_search_result llama_radix_tree::search(const llama_radix_node_key & 
         result.path = path;
         result.matched_length = static_cast<int32_t>(cur_searched_len);
 
+        // Update access metadata for LRU eviction on matched nodes
+        auto now = std::chrono::steady_clock::now();
+        for (auto & [node, len] : path) {
+            if (len > 0) {
+                node->last_accessed = now;
+                node->hit_count++;
+            }
+        }
+
         // Flatten cell indices and generations from the path
         for (auto & [node, len] : path) {
             for (int32_t i = 0; i < len; ++i) {
@@ -389,4 +398,76 @@ void llama_radix_tree::dot_helper(
     for (auto & [k, c] : n->children) {
         dot_helper(c, my_id, id_gen, os);
     }
+}
+
+//
+// LRU eviction (A6)
+//
+
+void llama_radix_tree::collect_leaves(llama_radix_node * node, std::vector<llama_radix_node *> & leaves) {
+    if (!node) { return; }
+    if (node->children.empty()) {
+        // leaf node (but not root)
+        if (node->parent != nullptr) {
+            leaves.push_back(node);
+        }
+        return;
+    }
+    for (auto & [k, c] : node->children) {
+        collect_leaves(c, leaves);
+    }
+}
+
+void llama_radix_tree::remove_leaf(llama_radix_node * leaf) {
+    if (!leaf || !leaf->parent) { return; }
+
+    // unregister cells from reverse index
+    unregister_cells(leaf);
+
+    // remove from parent's children
+    llama_radix_node * parent = leaf->parent;
+    for (auto it = parent->children.begin(); it != parent->children.end(); ++it) {
+        if (it->second == leaf) {
+            parent->children.erase(it);
+            break;
+        }
+    }
+
+    delete leaf;
+    node_count_--;
+
+    // if parent now has exactly one child and is not root, merge parent with child
+    if (parent->parent != nullptr && parent->children.size() == 1) {
+        // optional: could merge parent+child to maintain compact tree
+        // for now, leave as-is (correctness first)
+    }
+}
+
+int32_t llama_radix_tree::evict_lru(int32_t max_nodes) {
+    if (node_count_ <= max_nodes) {
+        return 0;
+    }
+
+    int32_t evicted = 0;
+
+    while (node_count_ > max_nodes) {
+        // collect current leaves
+        std::vector<llama_radix_node *> leaves;
+        collect_leaves(root_.get(), leaves);
+
+        if (leaves.empty()) {
+            break;  // nothing to evict
+        }
+
+        // find the least-recently-accessed leaf
+        auto oldest = std::min_element(leaves.begin(), leaves.end(),
+            [](const llama_radix_node * a, const llama_radix_node * b) {
+                return a->last_accessed < b->last_accessed;
+            });
+
+        remove_leaf(*oldest);
+        evicted++;
+    }
+
+    return evicted;
 }
