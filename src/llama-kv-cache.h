@@ -192,6 +192,13 @@ public:
             const llama_pos * positions,
             int64_t extra_key = 0);
 
+    // LRU eviction: evict least-recently-used leaf nodes until node count <= max_nodes
+    // returns number of nodes evicted
+    int32_t prefix_evict_lru(int32_t max_nodes);
+
+    // query radix tree node count (for threshold checks)
+    int32_t prefix_node_count() const;
+
     //
     // checkpoint / rollback API (for Agent scenarios)
     //

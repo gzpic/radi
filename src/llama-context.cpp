@@ -2652,6 +2652,28 @@ void llama_memory_prefix_cache_enable(llama_memory_t mem) {
     }
 }
 
+int32_t llama_memory_prefix_evict_lru(llama_memory_t mem, int32_t max_nodes) {
+    if (!mem) {
+        return 0;
+    }
+    auto * kv = dynamic_cast<llama_kv_cache *>(mem);
+    if (kv) {
+        return kv->prefix_evict_lru(max_nodes);
+    }
+    return 0;
+}
+
+int32_t llama_memory_prefix_node_count(llama_memory_t mem) {
+    if (!mem) {
+        return 0;
+    }
+    auto * kv = dynamic_cast<llama_kv_cache *>(mem);
+    if (kv) {
+        return kv->prefix_node_count();
+    }
+    return 0;
+}
+
 int32_t llama_memory_checkpoint_save(llama_memory_t mem) {
     if (!mem) {
         return -1;

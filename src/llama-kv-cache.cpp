@@ -368,6 +368,20 @@ int32_t llama_kv_cache::prefix_cache_reclaim(
     return reclaimed;
 }
 
+int32_t llama_kv_cache::prefix_evict_lru(int32_t max_nodes) {
+    if (!prefix_cache_enabled || !prefix_tree) {
+        return 0;
+    }
+    return prefix_tree->evict_lru(max_nodes);
+}
+
+int32_t llama_kv_cache::prefix_node_count() const {
+    if (!prefix_cache_enabled || !prefix_tree) {
+        return 0;
+    }
+    return prefix_tree->node_count();
+}
+
 //
 // checkpoint / rollback (A2)
 //
@@ -453,6 +467,12 @@ bool llama_kv_cache::merge(llama_seq_id winner) {
             forked_branches.end());
     }
 
+    // BUG-3 fix: merge changes seq 0's content entirely, invalidate all checkpoints
+    checkpoints.clear();
+
+    // BUG-4 fix: recycle seq_id so future forks don't permanently exhaust the pool
+    next_fork_seq_id = 1;
+
     return true;
 }
 
@@ -491,6 +511,13 @@ int32_t llama_kv_cache::selective_trim(llama_pos p0, llama_pos p1,
         std::vector<uint32_t>    cells(remaining_cells,  remaining_cells  + n_remaining);
         prefix_cache_promote(tokens, cells);
     }
+
+    // BUG-3 fix: invalidate checkpoints whose pos_end falls in or after the trimmed range,
+    // since positions have been shifted and the old pos_end no longer matches
+    checkpoints.erase(
+        std::remove_if(checkpoints.begin(), checkpoints.end(),
+            [p0](const kv_checkpoint & cp) { return cp.pos_end >= p0; }),
+        checkpoints.end());
 
     return (int32_t)n_remove;
 }
@@ -923,7 +950,7 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_
         int32_t n_prefix = 0;
         std::vector<uint32_t> prefix_cells;
 
-        if (prefix_cache_enabled && prefix_tree && n_stream == 1 && ubatch.n_seqs_unq == 1) {
+        if (prefix_cache_enabled && prefix_tree && n_stream == 1 && ubatch.n_seqs_unq == 1 && ubatch.token != nullptr) {
             const llama_seq_id seq_id = ubatch.seq_id_unq[0];
 
             // search the tree for matching prefix

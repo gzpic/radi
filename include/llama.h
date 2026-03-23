@@ -713,6 +713,13 @@ extern "C" {
     // No-op if the memory type does not support prefix caching.
     LLAMA_API void llama_memory_prefix_cache_enable(llama_memory_t mem);
 
+    // Evict least-recently-used leaf nodes from the prefix tree until node count <= max_nodes.
+    // Returns the number of nodes evicted.
+    LLAMA_API int32_t llama_memory_prefix_evict_lru(llama_memory_t mem, int32_t max_nodes);
+
+    // Query the current number of nodes in the prefix tree.
+    LLAMA_API int32_t llama_memory_prefix_node_count(llama_memory_t mem);
+
     //
     // Checkpoint / rollback (for Agent scenarios)
     //
