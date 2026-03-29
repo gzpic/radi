@@ -376,3 +376,5 @@ C7 的 cosine_sim=0.979 不是 bug，而是 selective_trim 的固有属性。Tri
   - `Cache overhead = 0.070 ± 0.003 ms/turn`
 - BUG-2 阶段 1：`prefix_cache_promote/find/reclaim` 已改为按 `seq_id -> stream` 绑定 generation 校验，并补了 2 个 multi-stream 回归 case
 - 详细命令与实测输出已记录到 `docs/session-runtime-mvp-notes.md` 第 10 节
+- 暂缓事项与下轮优先级清单见：`docs/session-runtime-mvp-notes.md` 第 12 节
+- Agent Runtime 路线规划对比测试已新增：`tests/test-agent-runtime-planner-bench.cpp` + `scripts/run-agent-runtime-comparison.ps1`（见 `docs/session-runtime-mvp-notes.md` 第 13 节）

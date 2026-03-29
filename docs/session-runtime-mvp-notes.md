@@ -312,3 +312,73 @@ tests/test-radix-tree-agent-bench.exe models/qwen3-0.6b/Qwen3-0.6B-Q8_0.gguf --r
 
 - 本次只修复 generation 绑定错误（BUG-2 阶段 1）。
 - `invalidate_cell(idx)` 仍是“仅按 cell idx”失效，不区分 stream；该问题留在 BUG-2 阶段 2 处理。
+
+---
+
+## 12. 遗留事项暂存（下轮优先级清单）
+
+> 状态说明：以下事项已确认“暂缓当前执行”，后续恢复时按优先级顺序推进。
+
+### P0（必须先做）
+
+1. BUG-2 阶段 2：实现 stream-local `invalidate` 语义  
+目标：避免不同 stream 在同 cell_idx 上互相误失效。
+
+2. BUG-2 阶段 2 回归测试补齐（L2）  
+范围：`promote/find/reclaim/overwrite/seq_rm` 的跨 stream 交叉场景。  
+通过标准：不串命中、不误复用、不误失效。
+
+### P1（完成 P0 后立即做）
+
+3. 一轮完整门禁回归  
+范围：`test-session` + `test-radix-tree` + `test-radix-tree-integration` + `test-radix-tree-features` + `test-radix-tree-consistency` + `test-radix-tree-agent-bench --runs 10`。  
+产物：固定格式测试记录（命令、通过率、关键指标、与上一版差异）。
+
+4. C8 fork+merge 一致性实跑（取消 skip）  
+前置：`n_seq_max > 1` 的配置与用例路径打通。  
+通过标准：C8 不再 SKIP，且不回归 C1~C7。
+
+### P2（收尾质量项）
+
+5. 并发与长稳健性补测  
+范围：并发会话、多次 clear/reclaim 循环、长时间运行下的一致性与稳定性漂移。
+
+6. 文档收口  
+将 BUG-2 阶段 2 的设计、实现细节、测试结果回填到本文件与 `docs/dev-log.md`，形成可复现闭环记录。
+
+---
+
+## 13. Agent Runtime 场景对比测试（2026-03-29）
+
+### 13.1 新增测试与脚本
+
+- 测试：`tests/test-agent-runtime-planner-bench.cpp`
+  - 场景：多路径路线规划（路径尝试、工具失败、回退、分支探索、删除无效路径、合并最优路径、trim 临时信息）。
+  - 对比口径：
+    - Baseline：每次尝试 `clear(true)` 后全量累计 prompt prefill
+    - Enhanced：`checkpoint/rollback + fork/merge + seq_rm(prune) + trim`
+  - 观测产物：
+    - `run-XX-events.jsonl`（逐步状态回放）
+    - `planner-comparison-summary.json`（结构化指标）
+    - `planner-comparison-summary.md`（可读汇总）
+
+- 运行脚本：`scripts/run-agent-runtime-comparison.ps1`
+  - 一键构建 `test-agent-runtime-planner-bench`
+  - 支持参数：`-Model`、`-Runs`、`-OutDir`
+
+### 13.2 中间状态断言（Enhanced）
+
+- base turn 后 `n_turns == 1`，`current_pos == seq0_pos_max`
+- path-A 失败后 rollback 回到 root checkpoint（位置和 turn 元数据恢复）
+- fork 后分支起点位置等于 root
+- prune 后无效分支 `seq_pos_max == -1`
+- merge 后 winner 状态进入 seq0，分支 id 被归一
+- trim 后临时 turn 被删除，位置不漂移
+
+### 13.3 Smoke 实测（Qwen3-0.6B-Q8_0，runs=1）
+
+- Baseline：`4468.5 ms`, `1216 tokens`
+- Enhanced：`1819.5 ms`, `409 tokens`
+- Token reduction：`66.37%`
+- Time reduction：`59.28%`
+- 状态断言：`20 pass / 0 fail`

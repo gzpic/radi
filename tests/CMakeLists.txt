@@ -232,3 +232,9 @@ target_include_directories(test-alloc PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src)
 #   tests/test-session.exe <model.gguf>
 unset(LLAMA_TEST_NAME)
 llama_build(test-session.cpp)
+
+# Agent runtime capability comparison benchmark (manual run with model path)
+# Usage:
+#   tests/test-agent-runtime-planner-bench.exe <model.gguf> [--runs N] [--out DIR]
+unset(LLAMA_TEST_NAME)
+llama_build(test-agent-runtime-planner-bench.cpp)
