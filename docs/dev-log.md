@@ -351,3 +351,17 @@ C7 的 cosine_sim=0.979 不是 bug，而是 selective_trim 的固有属性。Tri
   - BUG-1 ~ BUG-5 修复
   - fork 场景 L3 测试（需多 seq 配置）
   - ASan/UBSan/TSan 内存安全测试
+
+---
+
+## 八、Session Runtime MVP 补充（2026-03-29）
+
+- 已新增 Session Runtime MVP：
+  - `src/llama-session.h`
+  - `src/llama-session.cpp`
+  - `include/llama.h` 暴露 `llama_session_*` API
+  - `src/llama-context.cpp` 接入 C wrapper
+  - `src/CMakeLists.txt` 已编译接线
+- 已完成 `llama` 目标编译验证（`libllama.a` 通过）。
+- 详细设计与测试执行计划见：
+  - `docs/session-runtime-mvp-notes.md`
