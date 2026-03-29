@@ -171,7 +171,8 @@ public:
     void prefix_cache_promote(
             const std::vector<llama_token> & token_ids,
             const std::vector<uint32_t>    & cell_indices,
-            int64_t extra_key = 0);
+            int64_t extra_key = 0,
+            llama_seq_id seq_id = 0);
 
     // search for a prefix match in the tree
     // returns the number of tokens matched (0 if no match or prefix cache disabled)
@@ -179,7 +180,8 @@ public:
     int32_t prefix_cache_find(
             const std::vector<llama_token> & token_ids,
             std::vector<uint32_t>          & out_cell_indices,
-            int64_t extra_key = 0);
+            int64_t extra_key = 0,
+            llama_seq_id seq_id = 0);
 
     // reclaim prefix cells: restore cell metadata (pos + seq_id) for cached prefix tokens
     // so that they are treated as occupied by find_slot and do not get overwritten.

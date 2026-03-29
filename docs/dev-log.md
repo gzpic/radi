@@ -365,3 +365,14 @@ C7 的 cosine_sim=0.979 不是 bug，而是 selective_trim 的固有属性。Tri
 - 已完成 `llama` 目标编译验证（`libllama.a` 通过）。
 - 详细设计与测试执行计划见：
   - `docs/session-runtime-mvp-notes.md`
+
+### Session Runtime MVP 测试进展（2026-03-29）
+
+- T1 `test-session`（模型实跑）通过：4/4
+- T2 L2 三件套回归通过：`32/32`、`18/18`、`41/41`
+- T3 L3 一致性通过：`8/8`（C8 在 `n_seq_max=1` 下预期 skip）
+- T4 10-run benchmark：
+  - `Projected savings = 69.46 ± 0.57 %`
+  - `Cache overhead = 0.070 ± 0.003 ms/turn`
+- BUG-2 阶段 1：`prefix_cache_promote/find/reclaim` 已改为按 `seq_id -> stream` 绑定 generation 校验，并补了 2 个 multi-stream 回归 case
+- 详细命令与实测输出已记录到 `docs/session-runtime-mvp-notes.md` 第 10 节

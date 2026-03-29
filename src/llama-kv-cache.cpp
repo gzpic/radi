@@ -246,7 +246,8 @@ void llama_kv_cache::prefix_cache_enable(const llama_radix_tree_options & option
 void llama_kv_cache::prefix_cache_promote(
         const std::vector<llama_token> & token_ids,
         const std::vector<uint32_t>    & cell_indices,
-        int64_t extra_key) {
+        int64_t extra_key,
+        llama_seq_id seq_id) {
     if (!prefix_cache_enabled || !prefix_tree) {
         return;
     }
@@ -255,13 +256,19 @@ void llama_kv_cache::prefix_cache_promote(
         return;
     }
 
+    uint32_t strm = 0;
+    if (seq_id >= 0 && (size_t) seq_id < seq_to_stream.size()) {
+        strm = seq_to_stream[seq_id];
+    }
+    if (strm >= cell_generations.size()) {
+        return;
+    }
+
     // Build the generation snapshot for each cell at insert time.
-    // We use stream 0 for now (single-stream / unified cache).
-    // TODO: extend for multi-stream
     std::vector<uint64_t> gens(cell_indices.size());
     for (size_t i = 0; i < cell_indices.size(); ++i) {
         const uint32_t idx = cell_indices[i];
-        gens[i] = (idx < cell_generations[0].size()) ? cell_generations[0][idx] : 0;
+        gens[i] = (idx < cell_generations[strm].size()) ? cell_generations[strm][idx] : 0;
     }
 
     llama_radix_node_key key(llama_vector_view<llama_token>(token_ids), extra_key);
@@ -275,10 +282,19 @@ void llama_kv_cache::prefix_cache_promote(
 int32_t llama_kv_cache::prefix_cache_find(
         const std::vector<llama_token> & token_ids,
         std::vector<uint32_t>          & out_cell_indices,
-        int64_t extra_key) {
+        int64_t extra_key,
+        llama_seq_id seq_id) {
     out_cell_indices.clear();
 
     if (!prefix_cache_enabled || !prefix_tree) {
+        return 0;
+    }
+
+    uint32_t strm = 0;
+    if (seq_id >= 0 && (size_t) seq_id < seq_to_stream.size()) {
+        strm = seq_to_stream[seq_id];
+    }
+    if (strm >= cell_generations.size()) {
         return 0;
     }
 
@@ -302,7 +318,7 @@ int32_t llama_kv_cache::prefix_cache_find(
         }
 
         // check that the cell hasn't been overwritten since insertion
-        if (idx < cell_generations[0].size() && cell_generations[0][idx] == gen) {
+        if (idx < cell_generations[strm].size() && cell_generations[strm][idx] == gen) {
             out_cell_indices.push_back(idx);
             valid_count++;
         } else {
@@ -327,7 +343,7 @@ int32_t llama_kv_cache::prefix_cache_reclaim(
     // search the tree for matching prefix
     std::vector<llama_token> token_vec(tokens, tokens + n_tokens);
     std::vector<uint32_t> cached_cells;
-    int32_t matched = prefix_cache_find(token_vec, cached_cells, extra_key);
+    int32_t matched = prefix_cache_find(token_vec, cached_cells, extra_key, seq_id);
 
     if (matched <= 0) {
         return 0;
@@ -509,7 +525,7 @@ int32_t llama_kv_cache::selective_trim(llama_pos p0, llama_pos p1,
     if (remaining_tokens && remaining_cells && n_remaining > 0) {
         std::vector<llama_token> tokens(remaining_tokens, remaining_tokens + n_remaining);
         std::vector<uint32_t>    cells(remaining_cells,  remaining_cells  + n_remaining);
-        prefix_cache_promote(tokens, cells);
+        prefix_cache_promote(tokens, cells, 0, /*seq_id=*/0);
     }
 
     // BUG-3 fix: invalidate checkpoints whose pos_end falls in or after the trimmed range,
@@ -956,7 +972,7 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_
             // search the tree for matching prefix
             std::vector<llama_token> token_vec(ubatch.token, ubatch.token + ubatch.n_tokens);
             std::vector<uint32_t> cached_cells;
-            int32_t matched = prefix_cache_find(token_vec, cached_cells);
+            int32_t matched = prefix_cache_find(token_vec, cached_cells, 0, seq_id);
 
             if (matched > 0) {
                 // try to reclaim the matched cells
@@ -2497,7 +2513,7 @@ bool llama_kv_cache_context::apply() {
             // combine: prefix_cells + new_cells
             std::vector<uint32_t> all_cells = pm.prefix_cells;
             all_cells.insert(all_cells.end(), sinfo.idxs[0].begin(), sinfo.idxs[0].end());
-            kv->prefix_cache_promote(pm.full_tokens, all_cells);
+            kv->prefix_cache_promote(pm.full_tokens, all_cells, 0, pm.seq_id);
         }
     } else {
         // no prefix skip — promote normally
@@ -2507,7 +2523,8 @@ bool llama_kv_cache_context::apply() {
         if (ubatch.token && sinfo.n_stream() == 1 && !sinfo.idxs[0].empty()) {
             std::vector<llama_token> tokens(ubatch.token, ubatch.token + ubatch.n_tokens);
             std::vector<uint32_t>    cells(sinfo.idxs[0].begin(), sinfo.idxs[0].end());
-            kv->prefix_cache_promote(tokens, cells);
+            llama_seq_id seq_id = (ubatch.n_seqs_unq > 0) ? ubatch.seq_id_unq[0] : 0;
+            kv->prefix_cache_promote(tokens, cells, 0, seq_id);
         }
     }
 

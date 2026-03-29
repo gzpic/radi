@@ -55,11 +55,14 @@
 - Session Runtime MVP 代码接入并编译通过（`--target llama`）
 - 远端分支已同步：`codex/prefix-prepare-sideeffect-fix`
 - T1 已完成（新增 `tests/test-session.cpp`，模型实跑 4/4 通过）
+- T2 已完成（L2 三件套回归通过：32/32、18/18、41/41）
+- T3 已完成（L3 一致性 8/8 通过；C8 在 `n_seq_max=1` 下预期 skip）
+- T4 已完成（10-run benchmark：Projected savings `69.46 ± 0.57%`）
+- BUG-2 阶段 1 已完成：`prefix_cache_promote/find/reclaim` 绑定 `seq_id -> stream` 的 generation 视图
 
 未完成（明确留到下一阶段）：
-- `test-session.cpp` 单元测试
-- L2/L3/L4 全链路回归
-- BUG-2（multi-stream generation 绑定）
+- T5 / BUG-2 阶段 2：stream-local `invalidate_cell` 语义与多 stream reclaim 的完整闭环
+- C8 fork+merge 的多 seq 实跑（需 `n_seq_max > 1` 配置）
 
 ---
 
@@ -157,3 +160,155 @@ build/bin/test-session.exe models/qwen3-0.6b/Qwen3-0.6B-Q8_0.gguf
 - `fork + merge (n_seq_max > 1)`：PASS
 - `after_promote + overflow`：PASS
 - 汇总：`pass=4 fail=0`
+
+---
+
+## 9. 测试方法与用例设计说明（补充）
+
+### 9.1 测试方法（Method）
+
+本次 Session Runtime 采用“分层 + 不变量”的测试方法：
+
+1. 分层门禁  
+先过编译门禁（T0），再测 Session API（T1），最后再做 L2/L3/L4 回归，避免在未可编译状态下投入高成本回归。
+
+2. 不变量驱动  
+每个 case 都围绕状态不变量断言，而不是只看“函数返回成功”：
+- turn 数量变化是否符合预期
+- `turn_id -> [p0, p1)` 是否连续且可解释
+- rollback/trim/merge 后旧元数据是否被正确清理
+- `seq_pos_max` 是否与当前状态一致
+
+3. 真实模型最小集成  
+T1 不是纯 mock，而是加载最小可用模型（Qwen3-0.6B-Q8_0）走真实 `decode` 路径，确保 Session API 与真实 KV 行为对齐。
+
+4. 控制变量  
+统一 CPU 跑法、固定 `n_ctx/n_batch`，并在 `fork+merge` 场景显式设置 `n_seq_max > 1`，确保测试目标可触发、结果可复现。
+
+5. 先验证行为，再扩展性能  
+T1 只验证语义正确性；性能与波动控制放在 T4（`--runs` 多次统计）执行。
+
+### 9.2 用例设计（Case Design）
+
+`tests/test-session.cpp` 当前 4 个用例分别覆盖不同风险面：
+
+1. `turn + checkpoint + rollback`  
+目的：验证最基础会话流。  
+关键断言：
+- rollback 前后 `n_turns` 从 2 回到 1
+- 保留 turn 的 `turn_id` 正确
+- `current_pos == p1 - 1`
+
+2. `trim_turn + trim_turns`  
+目的：验证按语义删 turn 后的位置平移与元数据裁剪。  
+关键断言：
+- `trim_turn` 后 turn 数量减少
+- 存活 turn 的位置仍有序（前一段结束不晚于后一段开始）
+- `trim_turns` 后可清空目标范围
+
+3. `fork + merge (n_seq_max > 1)`  
+目的：验证多序列路径可达，且 merge 后主序列状态可继续使用。  
+关键断言：
+- `fork` 返回有效 seq_id
+- 分支 decode 成功
+- `merge` 成功且主序列位置推进到预期范围
+- 当前 MVP 语义下 turn 元数据在 merge 后清空
+
+4. `after_promote + overflow`  
+目的：验证自动维护钩子。  
+关键断言：
+- `after_promote` 触发后节点数不增加，且在阈值内
+- `check_overflow` 触发 soft clear 后，turn 元数据清空，`current_pos == -1`
+
+### 9.3 为什么这样设计
+
+- 这 4 个 case 对应 Session Runtime 的 4 条关键能力链路：状态追踪、结构变更、分支语义、自动维护。  
+- 每个 case 都覆盖“动作 + 状态后验”，能尽早发现“接口成功但状态错”的隐蔽问题。  
+- 先做最小闭环，再向 L2/L3/L4 扩展，可在成本可控下快速建立可信基线。
+
+---
+
+## 10. T2/T3/T4 实测记录（2026-03-29）
+
+### 10.1 运行环境约束
+
+- Windows + MSYS2 UCRT 运行时；执行前需把 `D:\SoftwareFilePlace\MSYS2\ucrt64\bin` 加入 `PATH`。
+- 模型：`models/qwen3-0.6b/Qwen3-0.6B-Q8_0.gguf`
+
+### 10.2 T2（L2 回归三件套）
+
+执行：
+
+```bash
+tests/test-radix-tree.exe
+tests/test-radix-tree-integration.exe
+tests/test-radix-tree-features.exe
+```
+
+结果：
+
+- `test-radix-tree.exe`：`32 passed, 0 failed`
+- `test-radix-tree-integration.exe`：`18 passed, 0 failed`
+- `test-radix-tree-features.exe`：`41 passed, 0 failed`
+
+结论：L2 层无回归。
+
+### 10.3 T3（L3 推理一致性）
+
+执行：
+
+```bash
+tests/test-radix-tree-consistency.exe models/qwen3-0.6b/Qwen3-0.6B-Q8_0.gguf
+```
+
+结果：
+
+- 总体：`8 passed, 0 failed`
+- C1~C6：通过（C1/C2/C3/C4/C6 为 bit-exact）
+- C7：通过（`max_abs_diff=3.232903`，`cosine=0.9791025808`，argmax 一致）
+- C8：`n_seq_max=1` 下 fork 不可用，按预期 skip 并计 PASS
+
+结论：Session Runtime 接入未破坏现有一致性基线。
+
+### 10.4 T4（L4 稳定性 benchmark）
+
+执行：
+
+```bash
+tests/test-radix-tree-agent-bench.exe models/qwen3-0.6b/Qwen3-0.6B-Q8_0.gguf --runs 10
+```
+
+关键输出（工具内置每个 run 前 `clear(true)`）：
+
+- Baseline total TTFT：`5874.2 ± 94.7 ms`
+- Projected total (A1)：`1793.7 ± 45.1 ms`
+- Projected savings：`69.46 ± 0.57 %`
+- Cache overhead：`0.070 ± 0.003 ms/turn`
+
+结论：在 10-run 稳定性口径下，TTFT 理论节省约 69.5%，波动可控（stddev < 2%）。
+
+---
+
+## 11. BUG-2 阶段 1（stream 绑定）记录（2026-03-29）
+
+### 11.1 代码改动
+
+- `src/llama-kv-cache.h`
+  - `prefix_cache_promote/find` 新增 `seq_id` 参数（默认 0），保持旧调用兼容。
+- `src/llama-kv-cache.cpp`
+  - `promote/find` generation 访问从固定 `cell_generations[0]` 改为 `cell_generations[seq_to_stream[seq_id]]`。
+  - `prefix_cache_reclaim` 内部 `find` 改为传入同一 `seq_id`。
+  - `prepare()/apply()/trim re-promote` 调用点补齐 `seq_id` 透传。
+
+### 11.2 回归测试
+
+- 文件：`tests/test-radix-tree-integration.cpp`
+- 新增用例：
+  - `harness_multistream_find_uses_seq_stream_generation`
+  - `harness_multistream_seq_to_stream_mapping_applies`
+- 当前汇总：`18 passed, 0 failed`
+
+### 11.3 边界说明
+
+- 本次只修复 generation 绑定错误（BUG-2 阶段 1）。
+- `invalidate_cell(idx)` 仍是“仅按 cell idx”失效，不区分 stream；该问题留在 BUG-2 阶段 2 处理。

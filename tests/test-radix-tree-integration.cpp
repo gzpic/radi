@@ -179,6 +179,96 @@ public:
     }
 };
 
+// Minimal multi-stream harness for BUG-2 regression:
+// validates that promote/find generation checks are bound to seq->stream.
+class PrefixCacheMultiStreamHarness {
+public:
+    uint32_t n_cells;
+    uint32_t n_stream;
+    std::vector<std::vector<uint64_t>> cell_generations; // [stream][cell]
+    std::vector<uint32_t> seq_to_stream;                 // [seq] -> stream
+    std::unique_ptr<llama_radix_tree> prefix_tree;
+
+    explicit PrefixCacheMultiStreamHarness(uint32_t n = 128, uint32_t ns = 2)
+        : n_cells(n), n_stream(ns) {
+        cell_generations.resize(n_stream, std::vector<uint64_t>(n_cells, 1));
+        seq_to_stream.resize(32, 0);
+        for (uint32_t s = 0; s < n_stream && s < seq_to_stream.size(); ++s) {
+            seq_to_stream[s] = s;
+        }
+        prefix_tree = std::make_unique<llama_radix_tree>();
+    }
+
+    void set_seq_stream(int32_t seq_id, uint32_t strm) {
+        if (seq_id < 0 || (size_t) seq_id >= seq_to_stream.size() || strm >= n_stream) {
+            return;
+        }
+        seq_to_stream[seq_id] = strm;
+    }
+
+    void set_generation(uint32_t strm, uint32_t idx, uint64_t gen) {
+        if (strm >= n_stream || idx >= n_cells) return;
+        cell_generations[strm][idx] = gen;
+    }
+
+    uint32_t stream_for_seq(int32_t seq_id) const {
+        if (seq_id < 0 || (size_t) seq_id >= seq_to_stream.size()) return 0;
+        return seq_to_stream[seq_id];
+    }
+
+    void promote(const std::vector<llama_token> & tokens,
+                 const std::vector<uint32_t> & cell_indices,
+                 int32_t seq_id,
+                 int64_t extra_key = 0) {
+        if (tokens.empty() || tokens.size() != cell_indices.size()) return;
+
+        const uint32_t strm = stream_for_seq(seq_id);
+        if (strm >= n_stream) return;
+
+        std::vector<uint64_t> gens(cell_indices.size());
+        for (size_t i = 0; i < cell_indices.size(); ++i) {
+            const uint32_t idx = cell_indices[i];
+            gens[i] = (idx < n_cells) ? cell_generations[strm][idx] : 0;
+        }
+
+        llama_radix_node_key key(llama_vector_view<llama_token>(tokens), extra_key);
+        llama_radix_node_value value;
+        value.cell_indices     = llama_vector_view<uint32_t>(cell_indices);
+        value.cell_generations = llama_vector_view<uint64_t>(gens);
+        prefix_tree->insert(key, value);
+    }
+
+    int32_t find(const std::vector<llama_token> & tokens,
+                 std::vector<uint32_t> & out_cells,
+                 int32_t seq_id,
+                 int64_t extra_key = 0) {
+        out_cells.clear();
+
+        const uint32_t strm = stream_for_seq(seq_id);
+        if (strm >= n_stream) return 0;
+
+        llama_radix_node_key key(llama_vector_view<llama_token>(tokens), extra_key);
+        auto result = prefix_tree->search(key);
+        if (!result.success || result.matched_length == 0) return 0;
+
+        int32_t valid = 0;
+        for (int32_t i = 0; i < result.matched_length; ++i) {
+            const uint32_t idx = result.cell_indices[i];
+            const uint64_t gen = result.cell_generations[i];
+
+            if (gen == 0) break;
+            if (idx < n_cells && cell_generations[strm][idx] == gen) {
+                out_cells.push_back(idx);
+                valid++;
+            } else {
+                break;
+            }
+        }
+
+        return valid;
+    }
+};
+
 // ============================================================================
 // Phase 3 Tests
 // ============================================================================
@@ -560,6 +650,55 @@ TEST(harness_clear_tree_preserves_generations) {
     // Find should return nothing
     std::vector<uint32_t> out;
     ASSERT_EQ(h.find({1, 2, 3}, out), 0);
+}
+
+TEST(harness_multistream_find_uses_seq_stream_generation) {
+    PrefixCacheMultiStreamHarness h(64, 2);
+
+    std::vector<llama_token> tokens = {11, 22, 33};
+    std::vector<uint32_t> cells = {4, 5, 6};
+    std::vector<uint32_t> out;
+
+    // Same cell indices have different generation snapshots across streams.
+    // seq 1 belongs to stream 1 and should use stream 1 generations.
+    h.set_generation(0, 4, 101);
+    h.set_generation(0, 5, 101);
+    h.set_generation(0, 6, 101);
+    h.set_generation(1, 4, 7);
+    h.set_generation(1, 5, 7);
+    h.set_generation(1, 6, 7);
+
+    h.promote(tokens, cells, /*seq_id=*/1, /*extra_key=*/123);
+
+    // seq 1 must match (uses stream 1 generations).
+    ASSERT_EQ(h.find(tokens, out, /*seq_id=*/1, /*extra_key=*/123), 3);
+    ASSERT_EQ((int32_t) out.size(), 3);
+
+    // seq 0 should not match this entry because stream 0 generations differ.
+    out.clear();
+    ASSERT_EQ(h.find(tokens, out, /*seq_id=*/0, /*extra_key=*/123), 0);
+}
+
+TEST(harness_multistream_seq_to_stream_mapping_applies) {
+    PrefixCacheMultiStreamHarness h(64, 2);
+
+    // Explicit non-trivial mapping: seq 5 -> stream 1.
+    h.set_seq_stream(5, 1);
+
+    std::vector<llama_token> tokens = {42, 43};
+    std::vector<uint32_t> cells = {8, 9};
+    std::vector<uint32_t> out;
+
+    h.set_generation(0, 8, 55);
+    h.set_generation(0, 9, 55);
+    h.set_generation(1, 8, 9);
+    h.set_generation(1, 9, 9);
+
+    h.promote(tokens, cells, /*seq_id=*/5, /*extra_key=*/77);
+
+    ASSERT_EQ(h.find(tokens, out, /*seq_id=*/5, /*extra_key=*/77), 2);
+    out.clear();
+    ASSERT_EQ(h.find(tokens, out, /*seq_id=*/0, /*extra_key=*/77), 0);
 }
 
 // ============================================================================
