@@ -226,3 +226,9 @@ target_link_libraries(${TEST_TARGET} PRIVATE llama)
 
 llama_build_and_test(test-alloc.cpp)
 target_include_directories(test-alloc PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src)
+
+# Session runtime model-backed tests (manual run with model path)
+# Usage:
+#   tests/test-session.exe <model.gguf>
+unset(LLAMA_TEST_NAME)
+llama_build(test-session.cpp)

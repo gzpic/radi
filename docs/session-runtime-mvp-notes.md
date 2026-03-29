@@ -54,6 +54,7 @@
 已完成：
 - Session Runtime MVP 代码接入并编译通过（`--target llama`）
 - 远端分支已同步：`codex/prefix-prepare-sideeffect-fix`
+- T1 已完成（新增 `tests/test-session.cpp`，模型实跑 4/4 通过）
 
 未完成（明确留到下一阶段）：
 - `test-session.cpp` 单元测试
@@ -128,3 +129,31 @@
 
 先做前 4 步即可判断 Session Runtime MVP 是否可合入主干。
 
+---
+
+## 8. T1 实测记录（2026-03-29）
+
+### 文件
+
+- `tests/test-session.cpp`
+- `tests/CMakeLists.txt`（新增 `test-session` 构建目标，手动传模型路径运行）
+
+### 编译
+
+```bash
+cmake --build build --target test-session -j4
+```
+
+### 运行
+
+```bash
+build/bin/test-session.exe models/qwen3-0.6b/Qwen3-0.6B-Q8_0.gguf
+```
+
+### 结果
+
+- `turn + checkpoint + rollback`：PASS
+- `trim_turn + trim_turns`：PASS
+- `fork + merge (n_seq_max > 1)`：PASS
+- `after_promote + overflow`：PASS
+- 汇总：`pass=4 fail=0`
