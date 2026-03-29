@@ -61,8 +61,10 @@ extern "C" {
     struct llama_model;
     struct llama_context;
     struct llama_sampler;
+    struct llama_session;
 
     typedef struct llama_memory_i * llama_memory_t;
+    typedef struct llama_session * llama_session_t;
 
     typedef int32_t llama_pos;
     typedef int32_t llama_token;
@@ -375,6 +377,15 @@ extern "C" {
     typedef struct llama_sampler_chain_params {
         bool no_perf; // whether to measure performance timings
     } llama_sampler_chain_params;
+
+    typedef struct llama_session_params {
+        // auto-evict threshold as ratio of n_ctx (e.g. 0.8 means evict when node_count > 0.8 * n_ctx)
+        float evict_threshold;
+        // warning threshold for KV usage ratio (currently informational, no hard fail)
+        float pressure_warn;
+        // override context length for ratio calculations; 0 means use llama_n_ctx(ctx)
+        uint32_t n_ctx;
+    } llama_session_params;
 
     // used in chat template
     typedef struct llama_chat_message {
@@ -762,8 +773,57 @@ extern "C" {
                  llama_pos     p0,
                  llama_pos     p1,
            const llama_token * remaining_tokens,
-           const uint32_t    * remaining_cells,
-                 int32_t       n_remaining);
+            const uint32_t    * remaining_cells,
+                  int32_t       n_remaining);
+
+    //
+    // Session runtime (Agent-facing state scheduling layer)
+    //
+
+    // Returns default session runtime params.
+    LLAMA_API struct llama_session_params llama_session_default_params(void);
+
+    // Create / free a session runtime bound to a context.
+    // Returns NULL on failure.
+    LLAMA_API llama_session_t llama_session_init(
+            struct llama_context * ctx,
+            struct llama_session_params params);
+    LLAMA_API void llama_session_free(llama_session_t session);
+
+    // Turn tracking.
+    // turn_begin returns a new turn id, or -1 on failure.
+    LLAMA_API int32_t llama_session_turn_begin(llama_session_t session);
+    LLAMA_API void    llama_session_turn_add_tokens(
+            llama_session_t     session,
+                 int32_t        turn_id,
+            const llama_token * tokens,
+                 int32_t        n_tokens);
+    LLAMA_API void    llama_session_turn_end(
+            llama_session_t session,
+                 int32_t    turn_id);
+
+    // Agent operations delegated to KV memory primitives.
+    LLAMA_API int32_t      llama_session_checkpoint_save(llama_session_t session);
+    LLAMA_API bool         llama_session_checkpoint_rollback(llama_session_t session, int32_t checkpoint_id);
+    LLAMA_API llama_seq_id llama_session_fork(llama_session_t session, llama_seq_id parent_seq);
+    LLAMA_API bool         llama_session_merge(llama_session_t session, llama_seq_id winner);
+    LLAMA_API int32_t      llama_session_trim_turn(llama_session_t session, int32_t turn_id);
+    LLAMA_API int32_t      llama_session_trim_turns(llama_session_t session, int32_t first_turn_id, int32_t last_turn_id);
+
+    // Auto-maintenance hooks.
+    LLAMA_API void llama_session_after_promote(llama_session_t session);
+    LLAMA_API void llama_session_check_overflow(llama_session_t session);
+
+    // Query APIs.
+    LLAMA_API float     llama_session_kv_usage(llama_session_t session);
+    LLAMA_API int32_t   llama_session_n_turns(llama_session_t session);
+    LLAMA_API llama_pos llama_session_current_pos(llama_session_t session);
+    LLAMA_API bool      llama_session_get_turn(
+            llama_session_t session,
+                 int32_t    index,
+                 int32_t  * turn_id_out,
+               llama_pos  * p0_out,
+               llama_pos  * p1_out);
 
     //
     // State / sessions

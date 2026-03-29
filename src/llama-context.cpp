@@ -7,6 +7,7 @@
 #include "llama-memory.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
+#include "llama-session.h"
 
 #include <cinttypes>
 #include <cstring>
@@ -2740,6 +2741,140 @@ int32_t llama_memory_selective_trim(llama_memory_t mem, llama_pos p0, llama_pos 
     }
 
     return -1;
+}
+
+llama_session_params llama_session_default_params(void) {
+    return llama_session::default_params();
+}
+
+llama_session_t llama_session_init(llama_context * ctx, llama_session_params params) {
+    if (!ctx) {
+        return nullptr;
+    }
+
+    try {
+        return new llama_session(ctx, params);
+    } catch (...) {
+        return nullptr;
+    }
+}
+
+void llama_session_free(llama_session_t session) {
+    delete session;
+}
+
+int32_t llama_session_turn_begin(llama_session_t session) {
+    if (!session) {
+        return -1;
+    }
+    return session->turn_begin();
+}
+
+void llama_session_turn_add_tokens(
+        llama_session_t     session,
+             int32_t        turn_id,
+        const llama_token * tokens,
+             int32_t        n_tokens) {
+    if (!session) {
+        return;
+    }
+    session->turn_add_tokens(turn_id, tokens, n_tokens);
+}
+
+void llama_session_turn_end(llama_session_t session, int32_t turn_id) {
+    if (!session) {
+        return;
+    }
+    session->turn_end(turn_id);
+}
+
+int32_t llama_session_checkpoint_save(llama_session_t session) {
+    if (!session) {
+        return -1;
+    }
+    return session->checkpoint_save();
+}
+
+bool llama_session_checkpoint_rollback(llama_session_t session, int32_t checkpoint_id) {
+    if (!session) {
+        return false;
+    }
+    return session->checkpoint_rollback(checkpoint_id);
+}
+
+llama_seq_id llama_session_fork(llama_session_t session, llama_seq_id parent_seq) {
+    if (!session) {
+        return -1;
+    }
+    return session->fork(parent_seq);
+}
+
+bool llama_session_merge(llama_session_t session, llama_seq_id winner) {
+    if (!session) {
+        return false;
+    }
+    return session->merge(winner);
+}
+
+int32_t llama_session_trim_turn(llama_session_t session, int32_t turn_id) {
+    if (!session) {
+        return -1;
+    }
+    return session->trim_turn(turn_id);
+}
+
+int32_t llama_session_trim_turns(llama_session_t session, int32_t first_turn_id, int32_t last_turn_id) {
+    if (!session) {
+        return -1;
+    }
+    return session->trim_turns(first_turn_id, last_turn_id);
+}
+
+void llama_session_after_promote(llama_session_t session) {
+    if (!session) {
+        return;
+    }
+    session->after_promote();
+}
+
+void llama_session_check_overflow(llama_session_t session) {
+    if (!session) {
+        return;
+    }
+    session->check_overflow();
+}
+
+float llama_session_kv_usage(llama_session_t session) {
+    if (!session) {
+        return 0.0f;
+    }
+    return session->kv_usage_ratio();
+}
+
+int32_t llama_session_n_turns(llama_session_t session) {
+    if (!session) {
+        return 0;
+    }
+    return session->n_turns();
+}
+
+llama_pos llama_session_current_pos(llama_session_t session) {
+    if (!session) {
+        return -1;
+    }
+    return session->current_pos();
+}
+
+bool llama_session_get_turn(
+        llama_session_t session,
+             int32_t    index,
+             int32_t  * turn_id_out,
+           llama_pos  * p0_out,
+           llama_pos  * p1_out) {
+    if (!session) {
+        return false;
+    }
+    return session->get_turn(index, turn_id_out, p0_out, p1_out);
 }
 
 // llama state API
